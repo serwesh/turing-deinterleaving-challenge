@@ -137,6 +137,11 @@ def train_stats(root: Path, mode: str, n_files: int, seed: int) -> dict:
 # ------------------------------------------------------------------------ methods
 
 
+# cluster_selection_epsilon > 0 is left out of the grids: scikit-learn 1.9.1's
+# HDBSCAN raises in traverse_upwards on some trees under NumPy 2.5, and the
+# official notebook found epsilon left the medians unchanged.
+
+
 class FeatureClusterer(Deinterleaver):
     """Feature transform + density clustering, optionally absorbing noise."""
 
@@ -191,20 +196,20 @@ METHODS = [
         "M4 HDBSCAN, physical + tuned",
         "physical",
         "hdbscan",
-        {"min_cluster_size": [3, 5, 8, 12, 20], "min_samples": [1, 3, 5, None], "cluster_selection_epsilon": [0.0, 0.05, 0.1, 0.2]},
+        {"min_cluster_size": [3, 5, 8, 12, 20], "min_samples": [1, 3, 5, None]},
     ),
     MethodSpec(
         "M5 HDBSCAN, physical + tuned + noise absorbed",
         "physical",
         "hdbscan",
-        {"min_cluster_size": [3, 5, 8, 12, 20], "min_samples": [1, 3, 5, None], "cluster_selection_epsilon": [0.0, 0.05, 0.1, 0.2]},
+        {"min_cluster_size": [3, 5, 8, 12, 20], "min_samples": [1, 3, 5, None]},
         absorb_noise=True,
     ),
     MethodSpec(
         "M6 DBSCAN, physical + tuned",
         "physical",
         "dbscan",
-        {"eps": [0.02, 0.05, 0.1, 0.2, 0.3, 0.5], "min_samples": [2, 3, 5, 10]},
+        {"eps": [0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0], "min_samples": [2, 3, 5, 10]},
     ),
 ]
 
