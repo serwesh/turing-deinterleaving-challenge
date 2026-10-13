@@ -298,6 +298,84 @@ def queue(args) -> None:
     print("queue finished", flush=True)
 
 
+# ------------------------------------------------------- CAESAR pointwise checkpoints
+
+_CK: dict = {}
+
+
+def _ck_init(path: str) -> None:
+    import contextlib
+    import io
+
+    import torch
+
+    sys.path.insert(0, str(CAESAR))
+    from caesar.repr.inference import InferenceContract
+
+    torch.set_num_threads(1)
+    with contextlib.redirect_stdout(io.StringIO()):
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+    _CK["contract"] = InferenceContract.from_checkpoint(path, ck, allow_turing_measurement=True)
+
+
+def _ck_features(raw: np.ndarray) -> np.ndarray:
+    """CAESAR's own 19 inputs for one window (temporal features built inside the window)."""
+
+    import contextlib
+    import io
+
+    import pandas as pd
+    from caesar.repr.inference import apply_persisted_scaler, build_feature_matrix
+
+    c = _CK["contract"]
+    frame = pd.DataFrame({"time_ms": raw[:, TOA] / 1000.0, "Freq(MHz)": raw[:, CF], "PW(µs)": raw[:, PW],
+                          "Azimuth(º)": raw[:, AOA], "Power(dBm)": raw[:, AMP],
+                          "source_file": "window", "scenario_id": "window"})
+    with contextlib.redirect_stdout(io.StringIO()):
+        x = build_feature_matrix(frame, c)
+    return apply_persisted_scaler(x, c.feature_names, c.scaler_params).astype(np.float32)
+
+
+def embed_caesar(args) -> None:
+    """Embed the tuning and test windows with a CAESAR pointwise checkpoint so that
+    ``eval`` scores it exactly like a grid run (unit-length embeddings, as in M7)."""
+
+    import contextlib
+    import io
+    from multiprocessing import Pool
+
+    import torch
+
+    sys.path.insert(0, str(CAESAR))
+    from caesar.repr.utils.weight_manager import WeightManager
+
+    out = OUT / args.mode / "runs" / args.name
+    out.mkdir(parents=True, exist_ok=True)
+    dev = f"cuda:{args.gpu}"
+    with contextlib.redirect_stdout(io.StringIO()):
+        model, ck = WeightManager().load_checkpoint(args.checkpoint, dev, allow_turing_measurement=True)
+    model.eval()
+    data = OUT / args.mode / "data"
+    with Pool(args.workers, initializer=_ck_init, initargs=(args.checkpoint,)) as pool:
+        for split in ("tune", "test"):
+            raw = np.load(data / f"raw_{split}.npy", mmap_mode="r")
+            emb = np.empty((len(raw), WINDOW, int(ck["emb_dim"])), np.float16)
+            for s in range(0, len(raw), 256):
+                feats = pool.map(_ck_features, [np.asarray(w) for w in raw[s : s + 256]])
+                x = torch.from_numpy(np.concatenate(feats)).to(dev)
+                with torch.no_grad():
+                    e = model(x).float()
+                e = torch.nn.functional.normalize(e, dim=-1).cpu().numpy().reshape(len(feats), WINDOW, -1)
+                emb[s : s + len(feats)] = e.astype(np.float16)
+            np.save(out / f"emb_{split}.npy", emb)
+            print(f"  {split}: {len(raw)} windows embedded", flush=True)
+    meta = {"mode": args.mode, "model": args.label_model, "loss": args.label_loss, "checkpoint": args.checkpoint,
+            "requires_normalized": True, "best_step": ck.get("best_epoch"), "train_seconds": None,
+            "params": int(sum(p.numel() for p in model.parameters())),
+            "identity_target": (ck.get("dataset_metadata") or {}).get("identity_target")}
+    (out / "meta.json").write_text(json.dumps(meta, indent=2, default=str))
+
+
 # --------------------------------------------------------------------------- eval
 
 HDBSCAN_GRID = [(mcs, ms) for mcs in (3, 5, 8, 12, 20) for ms in (1, 3, 5, None)]  # as M4
@@ -337,7 +415,8 @@ def _eval_job(mode: str, run: str, split: str, lo: int, hi: int, configs: list, 
             pred = _cluster(phys, e, variant, w, mcs, ms)
             if test:
                 rows.append({"run": run, "variant": variant, "i": i, "n_emitters": len(np.unique(y)),
-                             "n_clusters": len(np.unique(pred[pred != -1])), **fast_scores(pred, y)})
+                             "n_clusters": len(np.unique(pred[pred != -1])), "noise_frac": float((pred == -1).mean()),
+                             **fast_scores(pred, y)})
             else:
                 rows.append((run, k, i, v_measure_score(y, pred)))
     return rows
@@ -383,7 +462,11 @@ def evaluate(args) -> None:
             chosen_path.write_text(json.dumps(chosen, indent=2))
             med.to_csv(out / "tuning_all.csv", mode="a", header=not (out / "tuning_all.csv").exists(), index=False)
 
-        todo = [r for r in runs if not (out / f"test_{r}.csv.gz").exists()]
+        def tested(r: str) -> bool:  # files written before noise share was recorded are redone
+            f = out / f"test_{r}.csv.gz"
+            return f.exists() and "noise_frac" in pd.read_csv(f, nrows=0).columns
+
+        todo = [r for r in runs if not tested(r)]
         n_test = len(np.load(OUT / mode / "data" / "lab_test.npy", mmap_mode="r"))
         if todo:
             print(f"[{mode}] testing {len(todo)} runs on {n_test} windows", flush=True)
@@ -422,7 +505,8 @@ def summarize(mode: str) -> None:
                 "model": meta["model"], "loss": meta["loss"], "variant": variant,
                 "val_median_v": chosen[run][variant]["val_median_v"],
                 **{k: g[k].median() for k in ("V-measure", "Homogeneity", "Completeness", "Adjusted Rand Index",
-                                             "Adjusted Mutual Information", "MCC", "F1")},
+                                             "Adjusted Mutual Information", "MCC", "F1", "noise_frac", "n_clusters")
+                   if k in g},
                 "mean_v": g["V-measure"].mean(), "n_windows": len(g), "best_step": meta["best_step"],
                 "train_seconds": meta["train_seconds"], "params": meta["params"],
                 "min_cluster_size": chosen[run][variant]["min_cluster_size"],
@@ -466,6 +550,15 @@ def main() -> None:
     q.add_argument("--per-gpu", type=int, default=4)
     q.add_argument("--steps", type=int, default=4000)
     q.set_defaults(func=queue)
+    c = sub.add_parser("embed-caesar")
+    c.add_argument("--mode", required=True)
+    c.add_argument("--checkpoint", required=True)
+    c.add_argument("--name", required=True, help="run directory name")
+    c.add_argument("--label-model", default="caesar_residual")
+    c.add_argument("--label-loss", default="semi_hard")
+    c.add_argument("--gpu", type=int, default=0)
+    c.add_argument("--workers", type=int, default=16)
+    c.set_defaults(func=embed_caesar)
     e = sub.add_parser("eval")
     e.add_argument("--modes", nargs="+", default=["scan", "stare"])
     e.add_argument("--workers", type=int, default=32)
